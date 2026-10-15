@@ -163,23 +163,16 @@ jobs:
         with: { xcode-version: latest-stable }
       - uses: actions/download-artifact@v4
         with: { name: node-ios-arm64, path: out-node }
-      # 引擎 111MB，不进 git。放 Release（tag 固定为 engine-latest）。
+      # 引擎 113MB（压缩后 37MB），不进 git。放 Release（tag 固定为 engine-latest）。
       - name: Fetch engine bundle
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -euxo pipefail
-          mkdir -p _stage
-          cd _stage
-          gh release download engine-latest --clobber -R "$GITHUB_REPOSITORY"
-          ls -lh
-          if ls engine.tar.zst >/dev/null 2>&1; then
-            tar --use-compress-program=unzstd -xf engine.tar.zst
-          elif ls engine.tar.gz >/dev/null 2>&1; then
-            tar -xzf engine.tar.gz
-          else
-            echo 'no engine tarball found in release engine-latest' >&2; exit 1
-          fi
+          mkdir -p _stage && cd _stage
+          curl -fL --retry 3 -o engine.zip \
+            "https://github.com/${{ github.repository }}/releases/download/engine-latest/engine.zip"
+          ls -lh engine.zip
+          unzip -q engine.zip
+          ls
           cd ..
           mkdir -p iosport/engine
           cp -a _stage/engine/. iosport/engine/
