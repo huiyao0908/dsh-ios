@@ -18,7 +18,7 @@ on:
     inputs:
       node_ref:
         description: "Node.js git tag"
-        default: "v24.9.0"
+        default: "v22.19.0"
       build_ipa:
         description: "1 = 同时打 IPA"
         default: "1"
@@ -32,7 +32,7 @@ jobs:
     runs-on: macos-14            # arm64 host == arm64 target
     timeout-minutes: 180
     env:
-      NODE_REF: ${{ github.event.inputs.node_ref || 'v24.9.0' }}
+      NODE_REF: ${{ github.event.inputs.node_ref || 'v22.19.0' }}
       IOS_MIN: "15.0"
       STRICT: "0"                # 锚点漂移不中断，末尾看报告
     steps:
