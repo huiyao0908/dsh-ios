@@ -61,7 +61,7 @@ jobs:
       - name: iOS source fixups
         env:
           REPORT: ${{ github.workspace }}/fixups-report.txt
-        run: bash iosport/node-build/ios-source-fixups.sh node-src
+        run: bash node-build/ios-source-fixups.sh node-src
       - name: Configure (iphoneos-arm64, min iOS ${{ env.IOS_MIN }})
         working-directory: node-src
         run: |
@@ -109,7 +109,7 @@ jobs:
           set -euxo pipefail
           file out/Release/node
           otool -l out/Release/node | grep -A4 -E 'LC_BUILD_VERSION|LC_VERSION_MIN_IPHONEOS' || true
-          ldid -S../iosport/node-build/entitlements.plist out/Release/node
+          ldid -S../node-build/entitlements.plist out/Release/node
           echo "size: $(du -h out/Release/node | cut -f1)"
       - name: Capability probe (host can't run it; static checks only)
         working-directory: node-src
@@ -174,17 +174,17 @@ jobs:
           unzip -q engine.zip
           ls
           cd ..
-          mkdir -p iosport/engine
-          cp -a _stage/engine/. iosport/engine/
-          test -f iosport/engine/dsh/node_modules/@deepseek-ai/dsh/lib/bin.js
-          du -sh iosport/engine
+          mkdir -p engine
+          cp -a _stage/engine/. engine/
+          test -f engine/dsh/node_modules/@deepseek-ai/dsh/lib/bin.js
+          du -sh engine
       - name: Assemble unsigned IPA
         env:
           NODE_BIN: ${{ github.workspace }}/out-node/out/Release/node
-          ENGINE_DIR: ${{ github.workspace }}/iosport/engine
-          APP_DIR: ${{ github.workspace }}/iosport/app
+          ENGINE_DIR: ${{ github.workspace }}/engine
+          APP_DIR: ${{ github.workspace }}/app
           OUT_IPA: ${{ github.workspace }}/dist/DSH.ipa
-        run: bash iosport/scripts/build-ipa.sh
+        run: bash scripts/build-ipa.sh
       - uses: actions/upload-artifact@v4
         with:
           name: DSH-ipa
