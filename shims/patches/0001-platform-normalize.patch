@@ -1,0 +1,24 @@
+--- a/lib/runner-launch-B2zsQ1Dz.js
++++ b/lib/runner-launch-B2zsQ1Dz.js
+@@ -1,4 +1,12 @@
+ // dsh-ios-shim:platform
+ // iOS 上 process.platform === 'ios'（nodejs-mobile 风格），而引擎的
+ // createProcessInspector 只认 'darwin'。Darwin 内核接口在 iOS 上一致
+ // （libproc / proc_pidinfo / sysctl），且 MacProcessInspector 不加载
+ // 任何原生模块，所以直接映射过去。
++function __dshNormalizePlatform(p) {
++	if (p === "ios" || p === "iphoneos" || p === "iphonesimulator") return "darwin";
++	return p;
++}
+ function createProcessInspector(platform = process.platform, arch = process.arch, internals = DEFAULT_INTERNALS) {
+-	if (platform === "linux") return new LinuxProcessInspector(arch, internals);
+-	if (platform === "darwin") return new MacProcessInspector(internals);
+-	if (platform === "win32") return createWindowsProcessInspector();
+-	throw new Error(`subprocess-local: terminal inspection is unsupported on platform ${platform}`);
++	const __p = __dshNormalizePlatform(platform);
++	if (__p === "linux") return new LinuxProcessInspector(arch, internals);
++	if (__p === "darwin") return new MacProcessInspector(internals);
++	if (__p === "win32") return createWindowsProcessInspector();
++	// iOS 上宁可降级也不抛：抛异常会让整个引擎启动失败。
++	return new MacProcessInspector(internals);
+ }
