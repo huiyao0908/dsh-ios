@@ -127,13 +127,25 @@ PY
 # Run node --predictable so the process-wide mprotect flip has no W^X race with a
 # background compiler thread.
 python3 - <<'PY'
+import os, sys
+
 def patch(path, anchor, inject):
     s = open(path).read()
     if anchor not in s:
-        import os,sys
-    print("MISS-ANCHOR", path, repr(anchor[:70]), file=open(os.environ.get("REPORT","fixups-report.txt"),"a"))
-    return
-    open(path, "w").write(s.replace(anchor, inject, 1))
+        print("MISS-ANCHOR", path, repr(anchor[:70]),
+              file=open(os.environ.get("REPORT", "fixups-report.txt"), "a"))
+        if os.environ.get("STRICT") == "1":
+            sys.exit(1)
+        return
+    new = s.replace(anchor, inject, 1)
+    if new == s:
+        print("MISS-REPLACE", path, repr(anchor[:70]),
+              file=open(os.environ.get("REPORT", "fixups-report.txt"), "a"))
+        if os.environ.get("STRICT") == "1":
+            sys.exit(1)
+        return
+    open(path, "w").write(new)
+    print("patched:", path)
 
 # (A) build_config.h: enable the pthread-JIT-write-protect macro on iOS device too.
 patch("deps/v8/src/base/build_config.h",
