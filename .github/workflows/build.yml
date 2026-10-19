@@ -174,57 +174,78 @@ jobs:
       - name: Capability probe (static)
         working-directory: node-src
         run: |
+          # 教训：`nm "$BIN" | grep -q X` 在 pipefail 下必然误判 —— grep -q 命中即
+          # 退出，nm 收到 SIGPIPE，管道整体非 0。上一轮就是这样把「符号明明存在」
+          # 判成「符号缺失」，白烧 2.5 小时。请勿再改回管道。
           set -uo pipefail
           BIN=out/Release/node
+          TMP=$(mktemp -d)
+          trap 'rm -rf "$TMP"' EXIT
           fail=0
-
+          
+          echo "===== 0/5 产物基本检查 ====="
+          if [ ! -f "$BIN" ]; then echo "::error::二进制不存在"; exit 1; fi
+          SIZE=$(stat -f%z "$BIN")
+          echo "size=$SIZE"
+          if [ "$SIZE" -lt 30000000 ]; then echo "::error::二进制过小，编译不完整"; fail=1; fi
+          
           echo "===== 1/5 Mach-O 平台 ====="
-          file "$BIN"
-          if file "$BIN" | grep -q "Mach-O 64-bit executable arm64"; then
+          file "$BIN" > "$TMP/file.txt" 2>&1 || true
+          cat "$TMP/file.txt"
+          if grep -q "Mach-O 64-bit executable arm64" "$TMP/file.txt"; then
             echo "OK mach-o arm64"
           else
             echo "::error::不是 arm64 Mach-O"; fail=1
           fi
-          if otool -l "$BIN" | grep -A4 LC_BUILD_VERSION | grep -q "platform 2"; then
+          otool -l "$BIN" > "$TMP/otool.txt" 2>/dev/null || true
+          if grep -A4 LC_BUILD_VERSION "$TMP/otool.txt" | grep -q "platform 2"; then
             echo "OK platform 2 = iOS"
           else
             echo "::error::LC_BUILD_VERSION platform 不是 iOS"; fail=1
           fi
-
+          
           echo "===== 2/5 JIT 写保护符号（(A)(B)(C) 补丁生效的证据）====="
-          nm -gU "$BIN" 2>/dev/null | grep "SetJitWriteProtected" || echo "(no symbol)"
-          nm -gU "$BIN" 2>/dev/null | grep "RegisterJitRange" || echo "(RegisterJitRange 是 internal，允许缺)"
-          if nm -gU "$BIN" 2>/dev/null | grep -q "RegisterJitRange"; then
+          nm -gU "$BIN" > "$TMP/nm.txt" 2>/dev/null || nm "$BIN" > "$TMP/nm.txt" 2>/dev/null || true
+          echo "nm 行数: $(wc -l < "$TMP/nm.txt")"
+          grep "SetJitWriteProtected" "$TMP/nm.txt" || echo "(no SetJitWriteProtected)"
+          grep "RegisterJitRange" "$TMP/nm.txt" || echo "(no RegisterJitRange)"
+          if grep -q "RegisterJitRange" "$TMP/nm.txt"; then
             echo "OK RegisterJitRange 已编入（(B)(C) 补丁生效的铁证；stock V8 无此符号）"
           else
             echo "::error::RegisterJitRange 符号缺失 —— iOS JIT 补丁没编进去"; fail=1
           fi
-
+          if grep -q "SetJitWriteProtected" "$TMP/nm.txt"; then
+            echo "OK SetJitWriteProtected 已编入"
+          else
+            echo "::warning::SetJitWriteProtected 未导出（可能 inline），不致命"
+          fi
+          
           echo "===== 3/5 WASM 保留（静态）====="
           # 不能在 macOS 上执行 iOS 二进制（LC_BUILD_VERSION platform=2 会被内核
           # 以 EXEC_EXIT_REASON_WRONG_PLATFORM 直接 SIGKILL），所以只做静态检查。
-          if strings "$BIN" | grep -qE "WebAssembly\.(Module|Instance)|wasm_compile"; then
+          strings -a "$BIN" > "$TMP/strings.txt" 2>/dev/null || true
+          echo "strings 行数: $(wc -l < "$TMP/strings.txt")"
+          if grep -qE "WebAssembly|wasm_compile|WasmModule" "$TMP/strings.txt"; then
             echo "OK WASM 相关字符串存在"
+            grep -m3 -E "WebAssembly" "$TMP/strings.txt" || true
           else
-            echo "::warning::没找到 WASM 字符串，可能是被压缩了"
+            echo "::warning::没找到 WASM 字符串，可能被压缩"
           fi
-          if otool -L "$BIN" | grep -qE "JavaScriptCore|libswiftCore"; then
-            echo "OK 链接了 JavaScriptCore"
-          else
-            echo "(未链接 JavaScriptCore，V8 是静态编入的，正常)"
-          fi
-
+          
           echo "===== 4/5 引擎需要的 ESM loader 内部方法 ====="
-          strings "$BIN" 2>/dev/null | grep -m2 -E "getOrCreateModuleJob|getModuleJobForImport" \
-            || echo "(名字可能被压缩，不致命)"
-
+          if grep -q "getModuleJobForImport" "$TMP/strings.txt"; then
+            echo "OK getModuleJobForImport 存在"
+          else
+            echo "::warning::getModuleJobForImport 未找到（可能被压缩），不致命"
+          fi
+          
           echo "===== 5/5 fixups 报告 ====="
-          if [ -f "$REPORT" ]; then
+          if [ -n "${REPORT:-}" ] && [ -f "$REPORT" ]; then
             cat "$REPORT"
           else
-            echo "报告不存在（REPORT=$REPORT）—— 但不影响产物"
+            echo "报告不存在（REPORT=${REPORT:-<unset>}）—— 但不影响产物"
           fi
-
+          
           echo "===== probe fail=$fail ====="
           exit $fail
 
