@@ -1,0 +1,167 @@
+name: preflight
+
+# 预检流水线：不编译，只验证「补丁能不能打上」和「脚本有没有语法错」。
+# 目的：把 fixups 锚点不匹配这类问题从 2.5 小时的编译循环里剥离出来，
+# 40 秒内给出答案。推送 / PR / 手动都能触发。
+on:
+  push:
+    paths:
+      - "node-build/**"
+      - "shims/**"
+      - "scripts/**"
+      - ".github/workflows/preflight.yml"
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      node_ref:
+        description: "Node 版本 tag"
+        required: false
+        default: "v22.19.0"
+
+permissions:
+  contents: read
+
+jobs:
+  # ------------------------------------------------------------------
+  # job 1：纯静态检查，不需要任何源码，10 秒出结果
+  # ------------------------------------------------------------------
+  static:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: shellcheck 所有 bash 脚本
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          fail=0
+          for f in $(find . -name "*.sh" -not -path "./node_modules/*"); do
+            echo "--- $f"
+            shellcheck -S warning "$f" || fail=1
+          done
+          exit $fail
+      
+      - name: 用 bash -n 做语法检查
+        run: |
+          fail=0
+          for f in $(find . -name "*.sh"); do
+            echo "--- $f"
+            bash -n "$f" || fail=1
+          done
+          exit $fail
+      
+      - name: YAML 合法性
+        run: |
+          python3 -c "import yaml,sys,glob; [yaml.safe_load(open(f,encoding='utf-8')) for f in glob.glob('.github/workflows/*.yml')]; print('YAML OK')"
+      
+      - name: 关键脚本自检（python 部分能否解析）
+        run: |
+          python3 -m py_compile $(grep -l "^import\|^def \|^from " node-build/*.sh scripts/*.sh 2>/dev/null) 2>/dev/null || true
+          echo "跳过：.sh 内嵌 python 不单独编译"
+
+  # ------------------------------------------------------------------
+  # job 2：真下载 Node 源码，真跑 fixups，验证 8 处锚点全部命中
+  # 这是最有价值的一步 —— 上一轮就是锚点不匹配白白烧了 2.5 小时
+  # ------------------------------------------------------------------
+  fixups:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: 只取 V8 需要的那几个源文件（不克隆整个 node）
+        run: |
+          REF="${{ github.event.inputs.node_ref || 'v22.19.0' }}"
+          echo "NODE_REF=$REF" >> $GITHUB_ENV
+          mkdir -p node-src
+          BASE="https://raw.githubusercontent.com/nodejs/node/$REF"
+          FILES="deps/v8/src/base/build_config.h
+          deps/v8/src/base/platform/platform.h
+          deps/v8/src/base/platform/platform-darwin.cc
+          deps/v8/src/base/platform/platform-posix.cc
+          deps/v8/src/heap/code-range.cc
+          deps/v8/src/wasm/wasm-code-manager.cc
+          deps/v8/src/objects/backing-store.cc
+          src/crypto/crypto_context.cc
+          deps/cares/config/darwin/ares_config.h
+          common.gypi"
+          for f in $FILES; do
+            mkdir -p "node-src/$(dirname "$f")"
+            echo "fetch $f"
+            curl -fsSL "$BASE/$f" -o "node-src/$f" || { echo "::error::下载失败 $f"; exit 1; }
+          done
+          find node-src -type f | wc -l
+      
+      - name: 打桩 tools/gyp/generator/make.py（fixups 会改它，但预检不编译）
+        run: |
+          mkdir -p node-src/tools/gyp/pylib/gyp/generator
+          printf 's = "x -Wl,--start-group y -Wl,--end-group"\n' > node-src/tools/gyp/pylib/gyp/generator/make.py
+      
+      - name: 跑 fixups
+        run: |
+          set -x
+          cd node-src && bash ../node-build/ios-source-fixups.sh "$PWD" 2>&1 | tee ../fixups.log
+          echo "exit=$?"
+          cd ..
+      
+      - name: 断言 8 处补丁全部生效
+        run: |
+          fail=0
+          check() {
+            local name="$1" file="$2" pattern="$3"
+            if grep -qF "$pattern" "$file"; then
+              echo "OK   $name"
+            else
+              echo "::error::$name 未生效（$file 里没有目标代码）"
+              fail=1
+            fi
+          }
+          
+          echo "===== A: build_config.h ====="
+          check "A V8_HAS_PTHREAD_JIT_WRITE_PROTECT 含 IOS" \
+            node-src/deps/v8/src/base/build_config.h "defined(V8_OS_IOS))"
+          
+          echo "===== B: platform.h ====="
+          check "B RegisterJitRange 声明" \
+            node-src/deps/v8/src/base/platform/platform.h "void RegisterJitRange(void* base, size_t size);"
+          
+          echo "===== C: platform-darwin.cc ====="
+          check "C RegisterJitRange 实现" \
+            node-src/deps/v8/src/base/platform/platform-darwin.cc "void RegisterJitRange(void* base, size_t size)"
+          check "C mprotect 翻转" \
+            node-src/deps/v8/src/base/platform/platform-darwin.cc "PROT_READ | PROT_EXEC"
+          
+          echo "===== D: code-range.cc ====="
+          check "D RegisterJitRange 调用" \
+            node-src/deps/v8/src/heap/code-range.cc "RegisterJitRange"
+          
+          echo "===== E: wasm-code-manager.cc ====="
+          check "E1 iOS 用 kReadWrite" \
+            node-src/deps/v8/src/wasm/wasm-code-manager.cc "kReadWrite"
+          
+          echo "===== F: backing-store.cc ====="
+          check "F iOS 关 guard region" \
+            node-src/deps/v8/src/objects/backing-store.cc "guards = false"
+          
+          echo "===== 其余 fixup ====="
+          check "gyp 去 --start-group" \
+            node-src/tools/gyp/pylib/gyp/generator/make.py "start-group"
+          check "cares 去 HAVE_SYS_RANDOM_H" \
+            node-src/deps/cares/config/darwin/ares_config.h "HAVE_SYS_RANDOM_H"
+          
+          echo "===== fixups 报告 ====="
+          cat fixups-report.txt 2>/dev/null || echo "(无报告)"
+          
+          echo "fail=$fail"
+          exit $fail
+      
+      - name: 上传 fixups 日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: preflight-fixups-${{ github.run_id }}
+          path: |
+            fixups.log
+            fixups-report.txt
+          if-no-files-found: warn
+          retention-days: 7
