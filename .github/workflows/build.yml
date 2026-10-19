@@ -66,7 +66,7 @@ jobs:
         run: git clone --depth 1 --branch "$NODE_REF" https://github.com/nodejs/node.git node-src
 
       - name: iOS source fixups
-        run: bash iosport/node-build/ios-source-fixups.sh node-src
+        run: bash node-build/ios-source-fixups.sh node-src
 
       - name: Show fixups report
         if: always()
@@ -155,7 +155,7 @@ jobs:
           otool -l out/Release/node | grep -A4 -E "LC_BUILD_VERSION|LC_VERSION_MIN_IPHONEOS" || true
           echo "===== linked dylibs ====="
           otool -L out/Release/node
-          ldid -S"$GITHUB_WORKSPACE/iosport/node-build/entitlements.plist" out/Release/node
+          ldid -S"$GITHUB_WORKSPACE/node-build/entitlements.plist" out/Release/node
           echo "size: $(du -h out/Release/node | cut -f1)"
 
       # ------------------------------------------------------------------
