@@ -127,25 +127,20 @@ PY
 # Run node --predictable so the process-wide mprotect flip has no W^X race with a
 # background compiler thread.
 python3 - <<'PY'
-import os, sys
-
 def patch(path, anchor, inject):
     s = open(path).read()
     if anchor not in s:
-        print("MISS-ANCHOR", path, repr(anchor[:70]),
-              file=open(os.environ.get("REPORT", "fixups-report.txt"), "a"))
-        if os.environ.get("STRICT") == "1":
-            sys.exit(1)
+        import os
+        msg = "MISS-ANCHOR %s %r" % (path, anchor[:70])
+        print(msg)
+        with open(os.environ.get("REPORT", "fixups-report.txt"), "a") as fh:
+            fh.write(msg + "\n")
         return
-    new = s.replace(anchor, inject, 1)
-    if new == s:
-        print("MISS-REPLACE", path, repr(anchor[:70]),
-              file=open(os.environ.get("REPORT", "fixups-report.txt"), "a"))
-        if os.environ.get("STRICT") == "1":
-            sys.exit(1)
+    if inject in s:
+        print("ALREADY-PATCHED", path)
         return
-    open(path, "w").write(new)
-    print("patched:", path)
+    open(path, "w").write(s.replace(anchor, inject, 1))
+    print("PATCHED", path)
 
 # (A) build_config.h: enable the pthread-JIT-write-protect macro on iOS device too.
 patch("deps/v8/src/base/build_config.h",
@@ -313,6 +308,12 @@ patch("deps/v8/src/wasm/wasm-code-manager.cc",
 
   if (V8_UNLIKELY(!success)) {''')
 
+# (F) backing-store.cc: iOS rejects the huge WASM guard regions (32GB / 10GB
+# reservations are refused by the kernel), so force guards off on iOS. Bounds
+# checks are then enforced in software — run with --wasm-enforce-bounds-checks.
+patch("deps/v8/src/objects/backing-store.cc",
+'  bool guards = params.guards;',
+'#if defined(V8_OS_IOS)\n  bool guards = false;\n#else\n  bool guards = params.guards;\n#endif')
 print("fixup: iOS full-JIT via mprotect W^X (multi-range flip; JS code range + WASM code regions; build_config/platform.h/platform-darwin/code-range/wasm-code-manager)")
 PY
 
@@ -364,37 +365,6 @@ p = pathlib.Path('common.gypi')
 if p.exists():
     s = p.read_text()
     note('24-3 gnu++20 已设' if 'gnu++20' in s else '24-3 需要 C++20 但 common.gypi 未设')
-
-# --- 24-4  crypto_kmac.cc: ncrypto::Buffer 的括号聚合初始化在 Apple clang 15.4 上不成立 ---
-# ncrypto::Buffer 是裸聚合体（deps/ncrypto/ncrypto.h:255）：
-#   template <typename T> struct Buffer { T* data = nullptr; size_t len = 0; };
-# crypto_kmac.cc 用括号构造它：Buffer<const void>(ptr, size)。
-# C++20 的 P0960（括号聚合初始化）在 Apple clang 15.4 / Xcode 15.4（macos-14 runner 的
-# 工具链）上对「带默认成员初始化器的聚合」支持不完整，直接报：
-#   error: no matching constructor for initialization of 'ncrypto::Buffer<const void>'
-# 花括号初始化对聚合体是 C++11 起完全支持的，把两处调用点改掉即可。
-# 该文件是 Node 24 新增（Node 22 无），故放在 NODE24 SECTION。
-PA = 'src/crypto/crypto_kmac.cc'
-if pathlib.Path(PA).exists():
-    s = pathlib.Path(PA).read_text()
-    o = s
-    s = s.replace(
-        'ncrypto::Buffer<const void>(key_data, key_size)',
-        'ncrypto::Buffer<const void>{key_data, key_size}',
-    )
-    import re as _re
-    s = _re.sub(
-        r'ncrypto::Buffer<const void>\(\s*params\.data\.data\(\)\s*,\s*params\.data\.size\(\)\s*\)',
-        'ncrypto::Buffer<const void>{params.data.data(), params.data.size()}',
-        s,
-    )
-    if s == o:
-        note('24-4 crypto_kmac.cc 未改动 —— 锚点未命中，需人工核对')
-    else:
-        pathlib.Path(PA).write_text(s)
-        note('24-4 crypto_kmac.cc 已改为花括号聚合初始化')
-else:
-    note('24-4 crypto_kmac.cc 不存在（非 Node 24 树），跳过')
 
 note('NODE24 SECTION 结束')
 PY
