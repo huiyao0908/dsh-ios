@@ -308,12 +308,24 @@ patch("deps/v8/src/wasm/wasm-code-manager.cc",
 
   if (V8_UNLIKELY(!success)) {''')
 
-# (F) backing-store.cc: iOS rejects the huge WASM guard regions (32GB / 10GB
-# reservations are refused by the kernel), so force guards off on iOS. Bounds
-# checks are then enforced in software — run with --wasm-enforce-bounds-checks.
+# (F) backing-store.cc: iOS refuses the huge WASM guard regions (32GB / 10GB
+# virtual reservations), so force guards off on iOS. Bounds checks are then
+# enforced in software instead of relying on the trap handler.
+#
+# Verified anchor against node v22.19.0 deps/v8/src/objects/backing-store.cc:322
 patch("deps/v8/src/objects/backing-store.cc",
-'  bool guards = params.guards;',
-'#if defined(V8_OS_IOS)\n  bool guards = false;\n#else\n  bool guards = params.guards;\n#endif')
+"""  bool guards = trap_handler::IsTrapHandlerEnabled() &&
+                (wasm_memory == WasmMemoryFlag::kWasmMemory32 ||
+                 (is_wasm_memory64 && v8_flags.wasm_memory64_trap_handling));""",
+"""#if defined(V8_OS_IOS)
+  // iOS rejects the multi-GB guard reservations and the trap handler is not an
+  // option there, so disable guards and let V8 enforce bounds in software.
+  bool guards = false;
+#else
+  bool guards = trap_handler::IsTrapHandlerEnabled() &&
+                (wasm_memory == WasmMemoryFlag::kWasmMemory32 ||
+                 (is_wasm_memory64 && v8_flags.wasm_memory64_trap_handling));
+#endif""")
 print("fixup: iOS full-JIT via mprotect W^X (multi-range flip; JS code range + WASM code regions; build_config/platform.h/platform-darwin/code-range/wasm-code-manager)")
 PY
 
