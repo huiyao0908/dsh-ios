@@ -1,45 +1,47 @@
 name: build-dsh-ios
 
-# 两段式：
-#   job node  —— 按 j0shua-SYSON/node-ios 的配方交叉编译 Node 24（iOS arm64，全 JIT）
-#   job ipa   —— 把 Node + DSH 引擎 + Swift 壳 组装成未签名 IPA
+# 目标：iPhone 8 (A11) / iOS 16.6 / Dopamine rootless 上跑真 node + 真 DSH 引擎。
 #
-# 配方来源：https://github.com/j0shua-SYSON/node-ios
-#   上游在 iPhone 6s Plus (A9) / iOS 15.8.5 / Dopamine 上验证通过
-#   （JIT_HOTLOOP_OK, WASM_OK 42）。我们的目标是 A11 (iPhone 8) / iOS 16.6 / Dopamine，
-#   同一 rootless 越狱、同一 W^X 机制，兼容。
+# 唯一产物是 /var/jb/usr/bin/node（arm64 iOS，full JIT）。引擎、deb、图标都由本地脚本组装。
 #
-# 为什么不用 nodejs-mobile：
-#   它把 child_process/cluster 砍掉、把 process.platform 改成 'ios'。
-#   dsh 的 subprocess 层 / tool-bash / job / terminal / 插件安装全走 spawn，
-#   且引擎的 createProcessInspector 只认 'darwin'。
+# 配方来源：j0shua-SYSON/node-ios（在 A9 / iOS 15.8.5 上验证 JIT_HOTLOOP_OK + WASM_OK）。
+# 本工作流相对上游的改动：
+#   1. 修掉上游的 `cat "$REPORT"` unbound variable —— 上游在 A9 上跑通但探针步骤是坏的，
+#      任何 set -u 环境下都会 exit 1，产物其实已经编好了。
+#   2. 探针改成真断言：检查 JIT 符号、WASM 分支、Mach-O 平台，失败要打印报告。
+#   3. 编出来的 node 立刻用 --predictable --single-threaded 自证 JIT/WASM 可用，
+#      macos-14 runner 是 Apple Silicon，同 arm64 + 同 Darwin ABI，能直接执行 iOS 二进制。
+#   4. 把 node 单独打成 deb（不掺引擎），Release 上传，本地脚本再拉下来重打带引擎的 deb。
 on:
   workflow_dispatch:
     inputs:
       node_ref:
         description: "Node.js git tag"
         default: "v22.19.0"
-      build_ipa:
-        description: "1 = 同时打 IPA"
-        default: "1"
       jit:
-        description: "jit = 全 JIT(默认) / jitless = 纯解释器兜底"
+        description: "jit = mprotect W^X full JIT(默认) / jitless = 纯解释器兜底"
         default: "jit"
+      self_test:
+        description: "1 = 编完立刻在 runner 上跑 JIT/WASM 自证"
+        default: "1"
 permissions:
   contents: write
 jobs:
   node:
-    runs-on: macos-14            # arm64 host == arm64 target
-    timeout-minutes: 180
+    runs-on: macos-14
+    timeout-minutes: 200
     env:
       NODE_REF: ${{ github.event.inputs.node_ref || 'v22.19.0' }}
       IOS_MIN: "15.0"
-      STRICT: "0"                # 锚点漂移不中断，末尾看报告
+      STRICT: "1"
+      REPORT: ${{ github.workspace }}/fixups-report.txt
     steps:
       - uses: actions/checkout@v4
+
       - name: Pin Python 3.12（Node configure 拒绝 3.14）
         uses: actions/setup-python@v5
         with: { python-version: "3.12" }
+
       - name: Toolchain + SDK
         run: |
           set -euxo pipefail
@@ -47,21 +49,42 @@ jobs:
           xcrun --sdk iphoneos --show-sdk-version
           brew list ldid   >/dev/null 2>&1 || brew install ldid
           brew list ccache >/dev/null 2>&1 || brew install ccache
+          # REPORT 必须是空文件而不是不存在：fixups 脚本用 >> 追加，探针用 cat 读。
+          : > "$REPORT"
+
       - name: ccache
         uses: actions/cache@v4
         with:
           path: ~/.ccache
-          key: ccache-${{ env.NODE_REF }}-${{ env.IOS_MIN }}-${{ env.STRICT }}-${{ github.run_id }}
+          key: ccache-${{ env.NODE_REF }}-${{ env.IOS_MIN }}-${{ github.event.inputs.jit }}-${{ github.run_id }}
           restore-keys: |
             ccache-${{ env.NODE_REF }}-${{ env.IOS_MIN }}-
             ccache-${{ env.NODE_REF }}-
             ccache-
+
       - name: Clone Node ${{ env.NODE_REF }}
         run: git clone --depth 1 --branch "$NODE_REF" https://github.com/nodejs/node.git node-src
+
       - name: iOS source fixups
-        env:
-          REPORT: ${{ github.workspace }}/fixups-report.txt
-        run: bash node-build/ios-source-fixups.sh node-src
+        run: bash iosport/node-build/ios-source-fixups.sh node-src
+
+      - name: Show fixups report
+        if: always()
+        run: |
+          echo "===== fixups-report.txt ====="
+          cat "$REPORT" || echo "(no report)"
+          echo "===== grep MISS in report ====="
+          grep -c "^MISS" "$REPORT" 2>/dev/null || echo 0
+
+      - name: Fail on missing anchors
+        run: |
+          if grep -q "^MISS" "$REPORT" 2>/dev/null; then
+            echo "::error::fixups 有锚点没命中，V8 源码布局可能变了，中止。"
+            grep "^MISS" "$REPORT"
+            exit 1
+          fi
+          echo "all fixup anchors hit"
+
       - name: Configure (iphoneos-arm64, min iOS ${{ env.IOS_MIN }})
         working-directory: node-src
         run: |
@@ -75,58 +98,184 @@ jobs:
           export CXX_host="ccache clang++ -std=gnu++20"
           export LDFLAGS="-arch arm64 -isysroot $SDK -miphoneos-version-min=$IOS_MIN"
           export GYP_DEFINES="target_arch=arm64 host_arch=arm64 host_os=mac target_os=ios"
-          # --with-intl=small-icu: 引擎源码里可能有 \p{...} 正则；small-icu 比 none 稳。
-          # --without-node-snapshot / --without-node-code-cache: 快照与 code cache
-          #   都涉及可执行内存，iOS W^X 下容易出问题，上游也是这么关的。
+          # --without-node-snapshot / --without-node-code-cache：快照与 code cache 都要可执行内存，
+          #   iOS W^X 下最容易炸，上游同样关掉。
+          # --without-inspector：我们的引擎不用 node:inspector。
+          # --openssl-no-asm：openssl 的 arm64 perlasm 在 iOS 交叉编译里要额外 flag，关掉更稳。
           python3 configure \
             --dest-os=ios --dest-cpu=arm64 --cross-compiling \
             --with-intl=small-icu --without-npm \
             --without-node-snapshot --without-node-code-cache --without-inspector \
             --openssl-no-asm
+
       - name: Build
         working-directory: node-src
         run: |
+          # 不用 -e：失败后要把日志 dump 出来再退。
           set -uxo pipefail
           export CCACHE_DIR="$HOME/.ccache"
-          set +e
-          # -j2 不是笔误：V8 的 W^X JIT 修补动了 build_config.h 里的宏，
-          # 该头被整个 V8 包含，导致所有 V8 TU 都是 ccache 冷失。
-          # 三个并发冷 -O3 V8 编译会把 3 核 / 7GB 的 runner OOM 掉（静默 SIGKILL）。
+          # -j2 不是笔误：W^X JIT 补丁动了 build_config.h，该头被整个 V8 包含，
+          # 导致所有 V8 TU 都是 ccache 冷失。三个并发 -O3 V8 编译会把 3 核 / 7GB 的
+          # runner OOM 掉（静默 SIGKILL，日志里只有 Killed）。
           make -j2 2>&1 | tee build.log
           rc=${PIPESTATUS[0]}
-          echo "make rc=$rc"
-          set -e
+          echo "===== make rc=$rc ====="
           if [ "$rc" -ne 0 ]; then
-            echo '=== errors ==='
-            grep -nE 'error:|fatal error|Error [0-9]|ld: |Undefined symbols|clang: error' build.log \
-              | grep -viE 'no newline|Wnewline-eof|#warning|_GLIBCXX' | tail -80
+            echo "===== grep errors ====="
+            grep -nE "error:|fatal error|Error [0-9]|ld: |Undefined symbols|clang: error|No such file|Killed" build.log \
+              | grep -viE "no newline|Wnewline-eof|#warning|_GLIBCXX" | tail -120 || true
+            echo "===== last 200 lines ====="
+            tail -200 build.log
+            echo "===== first 60 lines ====="
+            head -60 build.log
+            echo "===== log size: $(wc -l < build.log) lines ====="
+            cp build.log "$GITHUB_WORKSPACE/build-failure.log" || true
             exit 1
           fi
           ls -la out/Release/node
+          du -h out/Release/node
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-failure-log
+          path: |
+            ${{ github.workspace }}/build-failure.log
+            node-src/build.log
+          retention-days: 14
+          if-no-files-found: warn
+
       - name: Verify + sign
         working-directory: node-src
         run: |
           set -euxo pipefail
           file out/Release/node
-          otool -l out/Release/node | grep -A4 -E 'LC_BUILD_VERSION|LC_VERSION_MIN_IPHONEOS' || true
-          ldid -S../node-build/entitlements.plist out/Release/node
+          echo "===== LC_BUILD_VERSION ====="
+          otool -l out/Release/node | grep -A4 -E "LC_BUILD_VERSION|LC_VERSION_MIN_IPHONEOS" || true
+          echo "===== linked dylibs ====="
+          otool -L out/Release/node
+          ldid -S"$GITHUB_WORKSPACE/iosport/node-build/entitlements.plist" out/Release/node
           echo "size: $(du -h out/Release/node | cut -f1)"
-      - name: Capability probe (host can't run it; static checks only)
+
+      # ------------------------------------------------------------------
+      # 关键探针。上一版死在这里只是因为 `cat "$REPORT"` 而 REPORT 没定义，
+      # 白白浪费一次完整编译。这一版每条都先判空再断言，且都带可读输出。
+      # ------------------------------------------------------------------
+      - name: Capability probe (static)
         working-directory: node-src
         run: |
-          set -euxo pipefail
-          nm -gU out/Release/node 2>/dev/null | grep -c 'SetJitWriteProtected' || true
-          strings out/Release/node | grep -m3 -E 'getOrCreateModuleJob|getModuleJobForImport' || echo '（内部方法名可为压缩名，不致命）'
-          echo '--- fixups report ---'
-          cat "$REPORT" 2>/dev/null || cat ../fixups-report.txt 2>/dev/null || true
-      - name: Package into deb (rootless)
+          set -uo pipefail
+          BIN=out/Release/node
+          fail=0
+
+          echo "===== 1/5 Mach-O 平台 ====="
+          file "$BIN"
+          if file "$BIN" | grep -q "Mach-O 64-bit executable arm64"; then
+            echo "OK mach-o arm64"
+          else
+            echo "::error::不是 arm64 Mach-O"; fail=1
+          fi
+          if otool -l "$BIN" | grep -A4 LC_BUILD_VERSION | grep -q "platform 2"; then
+            echo "OK platform 2 = iOS"
+          else
+            echo "::error::LC_BUILD_VERSION platform 不是 iOS"; fail=1
+          fi
+
+          echo "===== 2/5 JIT 写保护符号（(A)(B)(C) 补丁生效的证据）====="
+          nm -gU "$BIN" 2>/dev/null | grep "SetJitWriteProtected" || echo "(no symbol)"
+          nm -gU "$BIN" 2>/dev/null | grep "RegisterJitRange" || echo "(RegisterJitRange 是 internal，允许缺)"
+          if strings "$BIN" | grep -q "RegisterJitRange"; then
+            echo "OK RegisterJitRange 字符串在二进制里"
+          else
+            echo "::warning::二进制里找不到 RegisterJitRange 字符串，iOS JIT 分支可能没编进去"
+          fi
+
+          echo "===== 3/5 WASM 保留 ====="
+          if "$BIN" -e "console.log(typeof WebAssembly)" 2>/dev/null | grep -q object; then
+            echo "OK WebAssembly 存在"
+          else
+            echo "::error::WebAssembly 不可用 —— 这个二进制用不了（引擎的 fetch 依赖它）"; fail=1
+          fi
+
+          echo "===== 4/5 引擎需要的 ESM loader 内部方法 ====="
+          strings "$BIN" 2>/dev/null | grep -m2 -E "getOrCreateModuleJob|getModuleJobForImport" \
+            || echo "(名字可能被压缩，不致命)"
+
+          echo "===== 5/5 fixups 报告 ====="
+          if [ -f "$REPORT" ]; then
+            cat "$REPORT"
+          else
+            echo "报告不存在（REPORT=$REPORT）—— 但不影响产物"
+          fi
+
+          echo "===== probe fail=$fail ====="
+          exit $fail
+
+      # 编完立刻自证。macos-14 runner 是 Apple Silicon == arm64 + 同 Darwin ABI，
+      # 所以这份 iOS 二进制能在 runner 上直接跑。这是整个流程里最重要的一步：
+      # 如果 JIT/WASM 在这上面不通，装到 iPhone 上只会得到一行 bus error。
+      - name: Self-test on runner (JIT + WASM)
+        if: ${{ github.event.inputs.self_test == '1' }}
+        working-directory: node-src
+        run: |
+          set -uxo pipefail
+          BIN="$PWD/out/Release/node"
+          chmod +x "$BIN"
+          echo "===== A. 基本执行 ====="
+          "$BIN" --predictable --single-threaded -e "console.log('NODE', process.version, process.arch, process.platform)"
+          rc1=$?
+          echo "rc=$rc1"
+
+          echo "===== B. 热循环（验证 JIT 真的在写可执行页）====="
+          cat > /tmp/jit_probe.js <<'JS'
+          function hot(n) { let s = 0; for (let i = 0; i < n; i++) s += i * 3 - (i % 7); return s; }
+          let acc = 0;
+          const t0 = Date.now();
+          for (let k = 0; k < 40000; k++) acc += hot(2000) & 0xff;
+          console.log("JIT_HOTLOOP_OK", acc, (Date.now() - t0) + "ms");
+          JS
+          "$BIN" --predictable --single-threaded /tmp/jit_probe.js
+          rc2=$?
+          echo "rc=$rc2"
+
+          echo "===== C. WebAssembly（引擎的 undici 依赖它）====="
+          cat > /tmp/wasm_probe.js <<'JS'
+          const m = new WebAssembly.Module(new Uint8Array([
+            0x00,0x61,0x73,0x6d,0x01,0x00,0x00,0x00,
+            0x01,0x05,0x01,0x60,0x00,0x01,0x7f,
+            0x03,0x02,0x01,0x00,
+            0x07,0x08,0x01,0x04,0x6d,0x61,0x69,0x6e,0x00,0x00,
+            0x0a,0x06,0x01,0x04,0x00,0x41,0x2a,0x0b
+          ]));
+          const inst = new WebAssembly.Instance(m);
+          console.log("WASM_OK", inst.exports.main());
+          JS
+          "$BIN" --predictable --single-threaded /tmp/wasm_probe.js
+          rc3=$?
+          echo "rc=$rc3"
+
+          echo "===== D. fetch（undici + llhttp wasm）====="
+          "$BIN" --predictable --single-threaded -e "fetch('http://127.0.0.1:1/').then(()=>0).catch(e=>console.log('FETCH_OK', e.name))"
+          rc4=$?
+          echo "rc=$rc4"
+
+          echo "===== self-test rc: $rc1 $rc2 $rc3 $rc4 ====="
+          # rc4 允许非零（连接被拒本来就是预期），rc2/rc3 必须 0 —— WASM 不通引擎就废。
+          if [ "$rc2" -ne 0 ] || [ "$rc3" -ne 0 ]; then
+            echo "::error::JIT 或 WASM 自证失败，这个二进制装到 iPhone 上也起不来"
+            exit 1
+          fi
+
+      - name: Package node-only deb
         working-directory: node-src
         run: |
           set -euxo pipefail
           PKG=nodejs-ios
           VER="${NODE_REF#v}"
           ROOT=pkgroot
-          rm -rf "$ROOT"; mkdir -p "$ROOT/var/jb/usr/bin" "$ROOT/DEBIAN"
+          rm -rf "$ROOT"
+          mkdir -p "$ROOT/var/jb/usr/bin" "$ROOT/DEBIAN"
           cp out/Release/node "$ROOT/var/jb/usr/bin/node"
           chmod 0755 "$ROOT/var/jb/usr/bin/node"
           cat > "$ROOT/DEBIAN/control" <<EOF
@@ -137,56 +286,38 @@ jobs:
           Maintainer: DSH iOS port
           Section: Development
           Priority: optional
-          Description: Node.js $VER cross-compiled for jailbroken iOS arm64 (rootless)
+          Description: Node.js $VER cross-compiled for jailbroken iOS arm64 (rootless, full JIT)
           EOF
-          sed -i.bak 's/^          //' "$ROOT/DEBIAN/control"
+          sed -i.bak "s/^          //" "$ROOT/DEBIAN/control"
           rm -f "$ROOT/DEBIAN/control.bak"
           dpkg-deb -b -Zxz "$ROOT" "${PKG}_${VER}_iphoneos-arm64.deb"
           ls -lh *.deb
+          shasum -a 256 out/Release/node *.deb
+
       - uses: actions/upload-artifact@v4
         with:
           name: node-ios-arm64
           path: |
             node-src/out/Release/node
             node-src/*.deb
-            node-src/../fixups-report.txt
+            fixups-report.txt
+            node-src/build.log
           retention-days: 30
           if-no-files-found: error
 
-  ipa:
-    needs: node
-    if: ${{ github.event.inputs.build_ipa == '1' }}
-    runs-on: macos-14
-    steps:
-      - uses: actions/checkout@v4
-      - uses: maxim-lobanov/setup-xcode@v1
-        with: { xcode-version: latest-stable }
-      - uses: actions/download-artifact@v4
-        with: { name: node-ios-arm64, path: out-node }
-      # 引擎 113MB（压缩后 37MB），不进 git。放 Release（tag 固定为 engine-latest）。
-      - name: Fetch engine bundle
+      # Release 是给本地脚本拉取用的固定地址，tag 不变内容可覆盖。
+      - name: Publish to release
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euxo pipefail
-          mkdir -p _stage && cd _stage
-          curl -fL --retry 3 -o engine.zip \
-            "https://github.com/${{ github.repository }}/releases/download/engine-latest/engine.zip"
-          ls -lh engine.zip
-          unzip -q engine.zip
-          ls
-          cd ..
-          mkdir -p engine
-          cp -a _stage/engine/. engine/
-          test -f engine/dsh/node_modules/@deepseek-ai/dsh/lib/bin.js
-          du -sh engine
-      - name: Assemble unsigned IPA
-        env:
-          NODE_BIN: ${{ github.workspace }}/out-node/out/Release/node
-          ENGINE_DIR: ${{ github.workspace }}/engine
-          APP_DIR: ${{ github.workspace }}/app
-          OUT_IPA: ${{ github.workspace }}/dist/DSH.ipa
-        run: bash scripts/build-ipa.sh
-      - uses: actions/upload-artifact@v4
-        with:
-          name: DSH-ipa
-          path: dist/
-          retention-days: 30
+          TAG=node-ios-latest
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" \
+            --title "Node.js iOS arm64 (latest)" \
+            --notes "auto-built by build-dsh-ios run $GITHUB_RUN_ID"
+          gh release upload "$TAG" \
+            "node-src/out/Release/node#node-ios-arm64" \
+            node-src/nodejs-ios_*.deb \
+            --clobber
+          gh release view "$TAG"
